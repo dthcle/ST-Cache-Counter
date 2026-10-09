@@ -279,6 +279,22 @@ test('late stream usage updates an already attached message', async t => {
     assert.deepEqual(h.context.chat[1].swipe_info[0].extra[KEY], record);
 });
 
+for (const receivedType of ['normal', 'regenerate']) test(`regenerate inserts a new assistant slot and binds ${receivedType} completion`, async t => {
+    const h = await harness(t);
+    h.context.streamingProcessor = { messageId: -1 };
+    h.emit('GENERATION_STARTED', 'regenerate');
+    // Real ST deletes the old reply after STARTED and before the API call.
+    h.context.chat.pop();
+    await (await h.fetch({ type: 'regenerate' })).json();
+    h.context.chat.push(assistant());
+    h.emit('GENERATION_ENDED'); h.emit('MESSAGE_RECEIVED', 1, receivedType);
+    assert.equal(h.context.chat[1].extra[KEY].requests[0].usage.inputTokens, 100);
+    const diagnostic = h.window.STCacheCounterDiagnostics();
+    assert.ok(diagnostic.events.some(e => e.event === 'request-captured' && e.expectedId === 1));
+    assert.ok(diagnostic.events.some(e => e.event === 'message-received' && e.matchingRequests === 1));
+    assert.equal(JSON.stringify(diagnostic).includes('question'), false);
+});
+
 test('DeepSeek official stream without forwarded Content-Type records final usage on a new floor', async t => {
     const h = await harness(t);
     h.context.streamingProcessor = { messageId: -1 };

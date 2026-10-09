@@ -2,6 +2,13 @@ import { createUsageAccumulator } from './usage.js';
 import { observeResponse } from './capture.js';
 
 const KEY = 'st_cache_counter';
+const VERSION = '1.0.3';
+const diagnostics = [];
+function trace(event, details = {}) {
+    diagnostics.push({ time: new Date().toISOString(), event, ...details });
+    if (diagnostics.length > 40) diagnostics.shift();
+}
+window.STCacheCounterDiagnostics = () => ({ version: VERSION, events: structuredClone(diagnostics) });
 const context = () => SillyTavern.getContext();
 let session = null;
 let pending = [];
@@ -58,9 +65,10 @@ function attach(messageId, type) {
         if (target.id !== messageId || (target.message && target.message !== message)) return false;
         if (target.previous && c.chat[messageId - 1] !== target.previous) return false;
         if (target.swipeId !== undefined && message.swipe_id !== target.swipeId) return false;
-        return isContinuation(s.type) ? isContinuation(type) : type === s.type || (s.type === undefined && type === 'normal');
+        return isContinuation(s.type) ? isContinuation(type) : type === s.type || ([undefined, null, '', 'regenerate'].includes(s.type) && type === 'normal');
     });
     // Two generations targeting the same slot cannot safely be distinguished by this event.
+    trace('message-received', { messageId, type: type ?? null, matchingRequests: candidates.length, pendingTargets: pending.filter(s => s.requests.some(r => !r.attached)).map(s => ({ type: s.type ?? null, expectedId: s.expected?.id ?? null, requests: s.requests.length, usageSeen: s.requests.some(hasUsage) })) });
     if (candidates.length !== 1) return;
     const s = candidates[0];
     const requests = s.requests.filter(r => !r.attached && !r.failed && (!r.finished || r.complete || hasUsage(r)));
@@ -90,12 +98,19 @@ window.fetch = async function (input, init) {
     } catch { /* ordinary unrelated fetch */ }
     prunePending();
     const s = session;
-    if (!enabled() || !body || !s || !s.active || excludedTypes.has(s.type) || excludedTypes.has(body.type)) return originalFetch.apply(this, arguments);
-    if (body.type !== undefined && body.type !== s.type && !(isContinuation(body.type) && isContinuation(s.type))) return originalFetch.apply(this, arguments);
+    if (!enabled() || !body || !s || !s.active || excludedTypes.has(s.type) || excludedTypes.has(body.type)) {
+        if (body) trace('request-skipped', { enabled: enabled(), hasSession: !!s, active: !!s?.active, generationType: s?.type ?? null, requestType: body.type ?? null });
+        return originalFetch.apply(this, arguments);
+    }
+    if (body.type !== undefined && body.type !== s.type && !(isContinuation(body.type) && isContinuation(s.type))) {
+        trace('request-type-mismatch', { generationType: s.type ?? null, requestType: body.type });
+        return originalFetch.apply(this, arguments);
+    }
     const c = context();
     if (!s.expected) {
         const processorId = c.streamingProcessor?.messageId;
-        const existingTarget = ['swipe', 'regenerate'].includes(s.type) || isContinuation(s.type);
+        // Regenerate deletes the old assistant before fetch; it creates a new slot.
+        const existingTarget = s.type === 'swipe' || isContinuation(s.type);
         const id = Number.isInteger(processorId) && processorId >= 0 ? processorId : existingTarget ? c.chat.length - 1 : c.chat.length;
         const message = c.chat[id];
         s.expected = { id, message: message || null, previous: id > 0 ? c.chat[id - 1] : null, swipeId: message?.swipe_id };
@@ -111,6 +126,7 @@ window.fetch = async function (input, init) {
         accumulator: createUsageAccumulator(), complete: false, failed: false, attached: false,
     };
     s.requests.push(request);
+    trace('request-captured', { id: request.id, source: request.source, stream: body.stream === true, expectedId: s.expected.id, generationType: s.type ?? null });
     try {
         const response = await originalFetch.apply(this, arguments);
         if (!response.ok) request.failed = true;
@@ -119,6 +135,7 @@ window.fetch = async function (input, init) {
             else request.accumulator.ingest(data);
         }, success => {
             request.finished = true; request.complete = success && !request.failed;
+            trace('response-finished', { id: request.id, complete: request.complete, failed: request.failed, usage: request.accumulator.snapshot() });
             // Transport cancellation may still have real partial usage. Only HTTP
             // or provider error envelopes are hard failures excluded from binding.
             // An early stop hook can bind before the final usage event arrives.
@@ -140,6 +157,7 @@ window.fetch = async function (input, init) {
 const { eventSource, eventTypes } = context();
 const on = (name, fn) => { if (eventTypes[name]) eventSource.on(eventTypes[name], fn); };
 on('GENERATION_STARTED', (type, _options, dryRun) => {
+    trace('generation-started', { type: type ?? null, dryRun: !!dryRun });
     if (dryRun || excludedTypes.has(type)) return;
     prunePending();
     const c = context(); session = { type, active: true, started: Date.now(), chat: c.chat, chatId: c.chatId, requests: [], target: null };
@@ -168,6 +186,11 @@ for (const name of ['MESSAGE_SWIPED', 'CHARACTER_MESSAGE_RENDERED', 'MESSAGE_UPD
 const panel = document.createElement('div');
 panel.className = 'stcc-settings';
 panel.innerHTML = '<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>楼层 Token / 缓存统计</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label class="checkbox_label"><input type="checkbox" class="stcc-enabled"><span>启用逐楼层统计</span></label><p>采用 API 实际 usage；不估算缓存。用户楼层不单独计费，输入包含整个请求上下文。未知不代表 0。仅记录启用后的 Chat Completion 请求。</p><p>OpenAI 流式 usage 可能需通过自定义接口附加请求体启用：<code>stream_options: {include_usage: true}</code>。不支持该参数的中转站请勿设置。</p></div></div>';
+panel.innerHTML += `<details><summary>诊断 v${VERSION}</summary><p>生成后点击刷新，输出仅含事件、数字与 API 来源，不含正文或密钥。</p><button type="button" class="menu_button stcc-diagnostic">刷新诊断</button><pre class="stcc-diagnostic-output" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto"></pre></details>`;
+panel.querySelector('.stcc-diagnostic')?.addEventListener('click', () => {
+    const output = panel.querySelector('.stcc-diagnostic-output');
+    if (output) output.textContent = JSON.stringify(window.STCacheCounterDiagnostics(), null, 2);
+});
 const checkbox = panel.querySelector('input'); checkbox.checked = enabled();
 checkbox.addEventListener('change', () => { settings[KEY].enabled = checkbox.checked; context().saveSettingsDebounced(); render(); });
 document.querySelector('#extensions_settings2, #extensions_settings')?.append(panel);
