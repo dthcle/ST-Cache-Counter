@@ -289,10 +289,7 @@ for (const receivedType of ['normal', 'regenerate']) test(`regenerate inserts a 
     h.context.chat.push(assistant());
     h.emit('GENERATION_ENDED'); h.emit('MESSAGE_RECEIVED', 1, receivedType);
     assert.equal(h.context.chat[1].extra[KEY].requests[0].usage.inputTokens, 100);
-    const diagnostic = h.window.STCacheCounterDiagnostics();
-    assert.ok(diagnostic.events.some(e => e.event === 'request-captured' && e.expectedId === 1));
-    assert.ok(diagnostic.events.some(e => e.event === 'message-received' && e.matchingRequests === 1));
-    assert.equal(JSON.stringify(diagnostic).includes('question'), false);
+    assert.equal(h.window.STCacheCounterDiagnostics, undefined, 'stable build has no debug global');
 });
 
 test('DeepSeek official stream without forwarded Content-Type records final usage on a new floor', async t => {

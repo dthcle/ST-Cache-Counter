@@ -1,6 +1,6 @@
 {
   "name": "st-cache-counter",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": { "test": "node --test", "check": "node --check index.js && node --check usage.js && node --check capture.js" },
