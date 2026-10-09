@@ -25,13 +25,15 @@ export function createSseParser(onPayload, onTerminal = () => {}) {
     };
 }
 
-export function observeResponse(response, onPayload, onFinish) {
+export function observeResponse(response, onPayload, onFinish, { stream = false } = {}) {
     const payloadCallback = onPayload;
     const finishCallback = onFinish;
     onPayload = data => { try { payloadCallback(data); } catch (error) { console.warn('[ST Cache Counter] Usage observer failed', error); } };
     onFinish = success => { try { finishCallback(success); } catch (error) { console.warn('[ST Cache Counter] Usage completion observer failed', error); } };
     if (!response.ok) { onFinish(false); return response; }
-    if ((response.headers.get('content-type') || '').includes('text/event-stream') && response.body) {
+    // ST forwardFetchResponse pipes bytes without forwarding upstream headers.
+    // Use the actual request's stream flag, not Content-Type alone.
+    if ((stream || (response.headers.get('content-type') || '').includes('text/event-stream')) && response.body) {
         const decoder = new TextDecoder();
         let failed = false;
         let finished = false;

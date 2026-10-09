@@ -133,7 +133,7 @@ window.fetch = async function (input, init) {
                 render();
                 Promise.resolve().then(() => context().saveChat?.()).catch(error => console.warn('[ST Cache Counter] Could not save late usage', error));
             }
-        });
+        }, { stream: body.stream === true });
     } catch (error) { request.failed = true; throw error; }
 };
 

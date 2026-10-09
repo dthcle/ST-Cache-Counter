@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- 修复真实酒馆后端转发 SSE 不带 Content-Type 时，插件未捕获流式 usage 的问题；根据请求 stream 标记识别流。
+- 新增无响应头的 DeepSeek 官方流式用量与新楼层绑定回归测试，62 项测试通过。
+
 ## 1.0.1
 
 - 按 SillyTavern 1.19.0 源码修正流式 ENDED → MESSAGE_RECEIVED 时序。

@@ -279,6 +279,25 @@ test('late stream usage updates an already attached message', async t => {
     assert.deepEqual(h.context.chat[1].swipe_info[0].extra[KEY], record);
 });
 
+test('DeepSeek official stream without forwarded Content-Type records final usage on a new floor', async t => {
+    const h = await harness(t);
+    h.context.streamingProcessor = { messageId: -1 };
+    h.context.chat = [{ is_user: true, mes: 'question' }];
+    const payload = { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1000, prompt_cache_hit_tokens: 800, prompt_cache_miss_tokens: 200, completion_tokens: 100 } };
+    const wire = `data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`;
+    h.responses.push(new Response(new TextEncoder().encode(wire)));
+    h.emit('GENERATION_STARTED', undefined);
+    const response = await h.fetch({ stream: true, chat_completion_source: 'deepseek' });
+    assert.equal(response.headers.get('content-type'), null);
+    assert.equal(await response.text(), wire);
+    h.context.chat.push(assistant());
+    h.emit('GENERATION_ENDED'); h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    const usage = h.context.chat[1].extra[KEY].requests[0].usage;
+    assert.equal(usage.inputTokens, 1000); assert.equal(usage.cachedInputTokens, 800);
+    assert.equal(usage.uncachedInputTokens, 200); assert.equal(usage.outputTokens, 100);
+    assert.equal(usage.hitRate, 0.8);
+});
+
 test('quiet overlap and actual request type cannot steal a visible generation', async t => {
     const h = await harness(t);
     h.emit('GENERATION_STARTED', 'normal');

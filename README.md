@@ -52,6 +52,8 @@ https://github.com/dthcle/ST-Cache-Counter
 2. 若中转站不支持该字段，移除它；可改用非流式。
 3. 原生 OpenAI 连接在本版可能需要升级酒馆，或改用自定义连接。扩展**不声称**仅设置前端参数即可让旧后端返回 usage。
 
+DeepSeek 官方文档说明流式最后一个数据块会携带 usage，通常无需额外设置 include_usage。v1.0.2 起也兼容酒馆转发 SSE 时缺少 Content-Type 的情况，按实际请求 stream 标记捕获用量。
+
 本地 1.19.0 原生 Claude / Gemini **非流式**后端会重组回复并丢弃 usage；纯前端扩展无法恢复，因此显示未知。建议使用能透传 usage 的流式连接，或能返回 OpenAI 兼容 usage 的自定义接口。其他缺失字段同样显示未知。插件不会自动修改 API 配置或增加额外费用。
 
 1.19.0 的流式 GENERATION_ENDED 是 UI 解锁事件，会早于 MESSAGE_RECEIVED；插件保留请求归属直到楼层收到回复，并按原始生成类型处理非流式 appendFinal 续写。quiet/impersonate 后台生成不覆盖前台请求；目标存在歧义时不猜测归属。
