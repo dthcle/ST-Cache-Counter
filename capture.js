@@ -1,11 +1,12 @@
 // Observe bytes as SillyTavern consumes them: no duplicate request or background tee.
-export function createSseParser(onPayload) {
+export function createSseParser(onPayload, onTerminal = () => {}) {
     let buffer = '';
     let pendingCR = false;
     function event(block) {
         const data = block.split('\n').filter(x => x.startsWith('data:')).map(x => x.slice(5).trimStart()).join('\n');
-        if (!data || data.trim() === '[DONE]') return;
-        try { onPayload(JSON.parse(data)); } catch { /* non-JSON heartbeat */ }
+        if (!data) return;
+        if (data.trim() === '[DONE]') { onTerminal(); return; }
+        try { const payload = JSON.parse(data); onPayload(payload); if (payload.type === 'message_stop') onTerminal(); } catch { /* non-JSON heartbeat or isolated observer failure */ }
     }
     return {
         push(text) {
@@ -25,13 +26,17 @@ export function createSseParser(onPayload) {
 }
 
 export function observeResponse(response, onPayload, onFinish) {
+    const payloadCallback = onPayload;
+    const finishCallback = onFinish;
+    onPayload = data => { try { payloadCallback(data); } catch (error) { console.warn('[ST Cache Counter] Usage observer failed', error); } };
+    onFinish = success => { try { finishCallback(success); } catch (error) { console.warn('[ST Cache Counter] Usage completion observer failed', error); } };
     if (!response.ok) { onFinish(false); return response; }
     if ((response.headers.get('content-type') || '').includes('text/event-stream') && response.body) {
         const decoder = new TextDecoder();
         let failed = false;
         let finished = false;
         const finish = success => { if (!finished) { finished = true; onFinish(success && !failed); } };
-        const parser = createSseParser(data => { if (data.error || data.type === 'error') failed = true; onPayload(data); });
+        const parser = createSseParser(data => { if (data.error || data.type === 'error') failed = true; onPayload(data); }, () => finish(true));
         const reader = response.body.getReader();
         const body = new ReadableStream({
             async pull(controller) {

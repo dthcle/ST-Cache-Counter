@@ -4,7 +4,20 @@ import { observeResponse } from './capture.js';
 const KEY = 'st_cache_counter';
 const context = () => SillyTavern.getContext();
 let session = null;
+let pending = [];
 let serial = 0;
+const excludedTypes = new Set(['quiet', 'impersonate', 'first_message']);
+const isContinuation = type => ['continue', 'append', 'appendFinal'].includes(type);
+// ENDED is a UI event, not an ownership boundary. Bound retention without timers.
+function prunePending() {
+    const c = context(); const cutoff = Date.now() - 5 * 60 * 1000;
+    pending = pending.filter(s => s.chat === c.chat && s.chatId === c.chatId && s.started >= cutoff).slice(-16);
+    if (session && !pending.includes(session)) session = null;
+}
+function hasUsage(request) {
+    const usage = request.accumulator.snapshot();
+    return ['inputTokens', 'cachedInputTokens', 'cacheWriteTokens', 'outputTokens'].some(key => Number.isFinite(usage[key]));
+}
 const settings = context().extensionSettings;
 settings[KEY] ??= { enabled: true };
 const enabled = () => settings[KEY].enabled;
@@ -28,20 +41,32 @@ function render() {
         const number = x => x === null ? '未知' : x.toLocaleString('zh-CN');
         badge.textContent = `非缓存输入 ${number(sum('uncachedInputTokens'))} · 缓存输入 ${number(cached)} · 输出 ${number(sum('outputTokens'))} · 命中率 ${rate === null ? '未知' : (rate * 100).toFixed(1) + '%'}`;
         badge.title = records.length
-            ? `${records.length} 次 API 请求；输入总量 ${number(input)}；缓存写入 ${number(sum('cacheWriteTokens'))}。命中率=缓存读取/输入总量。API未提供的字段显示未知；续写累加，切换候选回复独立保存。${record.edited ? ' 内容已编辑，统计仍为原请求用量。' : ''}${records.some(r => r.multiChoice) ? ' 多候选请求的 usage 是请求总量，不能拆分到各候选。' : ''}`
+            ? `${records.length} 次 API 请求；输入总量 ${number(input)}；缓存写入 ${number(sum('cacheWriteTokens'))}。命中率=缓存读取/输入总量。API未提供的字段显示未知；续写累加，切换候选回复独立保存。${record.edited ? ' 内容已编辑，统计仍为原请求用量。' : ''}${records.some(r => !r.complete) ? ' 含未完成请求，仅为已收到的部分 usage，不代表最终计费。' : ''}${records.some(r => r.multiChoice) ? ' 多候选请求的 usage 是请求总量，不能拆分到各候选。' : ''}`
             : '未记录到实际 API usage；历史消息、开场白或未返回 usage 的接口无法准确补算。';
     });
 }
 
 function attach(messageId, type) {
-    const c = context(); const s = session;
-    if (!s || s.chat !== c.chat || s.chatId !== c.chatId || ['quiet', 'impersonate', 'first_message'].includes(type)) return;
+    prunePending();
+    const c = context();
+    if (excludedTypes.has(type)) return;
     const message = c.chat[messageId];
     if (!message || message.is_user || message.is_system) return;
-    const requests = s.requests.filter(r => !r.attached && !r.failed);
+    const candidates = pending.filter(s => {
+        if (!s.expected || !s.requests.some(r => !r.attached && !r.failed && (!r.finished || r.complete || hasUsage(r)))) return false;
+        const target = s.expected;
+        if (target.id !== messageId || (target.message && target.message !== message)) return false;
+        if (target.previous && c.chat[messageId - 1] !== target.previous) return false;
+        if (target.swipeId !== undefined && message.swipe_id !== target.swipeId) return false;
+        return isContinuation(s.type) ? isContinuation(type) : type === s.type || (s.type === undefined && type === 'normal');
+    });
+    // Two generations targeting the same slot cannot safely be distinguished by this event.
+    if (candidates.length !== 1) return;
+    const s = candidates[0];
+    const requests = s.requests.filter(r => !r.attached && !r.failed && (!r.finished || r.complete || hasUsage(r)));
     if (!requests.length) return;
     message.extra ??= {};
-    const prior = type === 'continue' ? message.extra[KEY]?.requests || [] : [];
+    const prior = isContinuation(s.type) ? message.extra[KEY]?.requests || [] : [];
     message.extra[KEY] = { version: 1, requests: [...prior, ...requests.map(r => ({
         id: r.id, source: r.source, model: r.model, time: r.time,
         multiChoice: r.multiChoice, complete: r.complete, usage: r.accumulator.snapshot(),
@@ -63,8 +88,23 @@ window.fetch = async function (input, init) {
         url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
         if (url.origin === location.origin && url.pathname === '/api/backends/chat-completions/generate' && typeof init?.body === 'string') body = JSON.parse(init.body);
     } catch { /* ordinary unrelated fetch */ }
+    prunePending();
     const s = session;
-    if (!enabled() || !body || !s || ['quiet', 'impersonate'].includes(s.type)) return originalFetch.apply(this, arguments);
+    if (!enabled() || !body || !s || !s.active || excludedTypes.has(s.type) || excludedTypes.has(body.type)) return originalFetch.apply(this, arguments);
+    if (body.type !== undefined && body.type !== s.type && !(isContinuation(body.type) && isContinuation(s.type))) return originalFetch.apply(this, arguments);
+    const c = context();
+    if (!s.expected) {
+        const processorId = c.streamingProcessor?.messageId;
+        const existingTarget = ['swipe', 'regenerate'].includes(s.type) || isContinuation(s.type);
+        const id = Number.isInteger(processorId) && processorId >= 0 ? processorId : existingTarget ? c.chat.length - 1 : c.chat.length;
+        const message = c.chat[id];
+        s.expected = { id, message: message || null, previous: id > 0 ? c.chat[id - 1] : null, swipeId: message?.swipe_id };
+        if (message && !isContinuation(s.type)) {
+            // ST may copy old arbitrary extra fields into a newly generated swipe.
+            // Preserve the old candidate's saved extra, but clear only the live view.
+            if (message.extra?.[KEY]) { message.extra = { ...message.extra }; delete message.extra[KEY]; render(); }
+        }
+    }
     const request = {
         id: ++serial, source: body.chat_completion_source, model: body.model,
         time: new Date().toISOString(), multiChoice: body.n > 1,
@@ -73,11 +113,14 @@ window.fetch = async function (input, init) {
     s.requests.push(request);
     try {
         const response = await originalFetch.apply(this, arguments);
+        if (!response.ok) request.failed = true;
         return observeResponse(response, data => {
             if (data.error || data.type === 'error') request.failed = true;
             else request.accumulator.ingest(data);
         }, success => {
-            request.complete = success && !request.failed; request.failed ||= !success;
+            request.finished = true; request.complete = success && !request.failed;
+            // Transport cancellation may still have real partial usage. Only HTTP
+            // or provider error envelopes are hard failures excluded from binding.
             // An early stop hook can bind before the final usage event arrives.
             if (request.attached && context().chat === s.chat && context().chatId === s.chatId) {
                 const message = request.message;
@@ -97,15 +140,27 @@ window.fetch = async function (input, init) {
 const { eventSource, eventTypes } = context();
 const on = (name, fn) => { if (eventTypes[name]) eventSource.on(eventTypes[name], fn); };
 on('GENERATION_STARTED', (type, _options, dryRun) => {
-    if (dryRun) return;
-    const c = context(); session = { type, chat: c.chat, chatId: c.chatId, requests: [], target: null };
+    if (dryRun || excludedTypes.has(type)) return;
+    prunePending();
+    const c = context(); session = { type, active: true, started: Date.now(), chat: c.chat, chatId: c.chatId, requests: [], target: null };
+    pending.push(session);
+    prunePending();
 });
 on('MESSAGE_RECEIVED', attach);
-on('GENERATION_ENDED', () => { session = null; render(); });
-on('CHAT_CHANGED', () => { session = null; render(); });
+// ST 1.19 streaming unlocks the UI (ENDED) before emitting MESSAGE_RECEIVED.
+// Stop collecting new requests, but retain this request context for that event.
+on('GENERATION_ENDED', () => { if (session) session.active = false; render(); });
+on('CHAT_CHANGED', () => { session = null; pending = []; render(); });
 on('MESSAGE_EDITED', id => {
-    const record = context().chat[id]?.extra?.[KEY];
-    if (record) record.edited = true;
+    const message = context().chat[id];
+    const record = message?.extra?.[KEY];
+    if (record) {
+        record.edited = true;
+        if (message.swipe_info?.[message.swipe_id]) {
+            message.swipe_info[message.swipe_id].extra ??= {};
+            message.swipe_info[message.swipe_id].extra[KEY] = structuredClone(record);
+        }
+    }
     render();
 });
 for (const name of ['MESSAGE_SWIPED', 'CHARACTER_MESSAGE_RENDERED', 'MESSAGE_UPDATED', 'MESSAGE_DELETED', 'MORE_MESSAGES_LOADED', 'MESSAGE_SWIPE_DELETED']) on(name, render);

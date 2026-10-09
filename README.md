@@ -1,6 +1,6 @@
 # ST-Cache-Counter
 
-适配 **SillyTavern 1.14.0** 的第三方前端扩展。每个 AI 回复楼层显示非缓存输入、缓存输入、输出 token 和缓存命中率，使用 API 实际返回的 usage，而不是本地 tokenizer 估算。
+针对 **SillyTavern 1.19.0** 开发并检查源码兼容性的第三方前端扩展（同时参考了 1.14.0 的接口）。每个 AI 回复楼层显示非缓存输入、缓存输入、输出 token 和缓存命中率，使用 API 实际返回的 usage，而不是本地 tokenizer 估算。
 
 ## 安装
 
@@ -34,7 +34,7 @@
 
 以上是**格式兼容**，并不保证每家服务或中转站都会返回所有字段。前端只观察同源 `/api/backends/chat-completions/generate` 响应，不拦截其他网页请求、不发送额外模型请求。JSON 与 SSE 流式均支持，流事件的累计 usage 覆盖旧值，不把快照重复相加。
 
-### SillyTavern 1.14.0 的流式限制
+### SillyTavern 1.19.0 / 1.14.0 的 usage 限制
 
 本版本后端重新构造上游请求体，不会转发前端任意 `stream_options`。OpenAI 常需 `stream_options: {include_usage: true}` 才返回流式 usage：
 
@@ -46,7 +46,9 @@
 2. 若中转站不支持该字段，移除它；可改用非流式。
 3. 原生 OpenAI 连接在本版可能需要升级酒馆，或改用自定义连接。扩展**不声称**仅设置前端参数即可让旧后端返回 usage。
 
-Claude/Gemini 能否获得 usage 还取决于上游及后端是否转发；遗漏字段显示未知。插件不会自动修改 API 配置或增加额外费用。
+本地 1.19.0 原生 Claude / Gemini **非流式**后端会重组回复并丢弃 usage；纯前端扩展无法恢复，因此显示未知。建议使用能透传 usage 的流式连接，或能返回 OpenAI 兼容 usage 的自定义接口。其他缺失字段同样显示未知。插件不会自动修改 API 配置或增加额外费用。
+
+1.19.0 的流式 GENERATION_ENDED 是 UI 解锁事件，会早于 MESSAGE_RECEIVED；插件保留请求归属直到楼层收到回复，并按原始生成类型处理非流式 appendFinal 续写。quiet/impersonate 后台生成不覆盖前台请求；目标存在歧义时不猜测归属。
 
 ## 边界与数据保存
 

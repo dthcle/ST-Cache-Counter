@@ -119,6 +119,24 @@ test('SSE error envelopes finish unsuccessfully', async () => {
     assert.deepEqual(finishes, [false]);
 });
 
+test('DONE marks completion before EOF and cancellation does not duplicate callback', async () => {
+    const finishes = [];
+    const encoder = new TextEncoder();
+    const response = new Response(new ReadableStream({ start(c) { c.enqueue(encoder.encode('data: [DONE]\n\n')); } }), { headers: { 'content-type': 'text/event-stream' } });
+    const reader = observeResponse(response, () => {}, value => finishes.push(value)).body.getReader();
+    await reader.read();
+    assert.deepEqual(finishes, [true]);
+    await reader.cancel();
+    assert.deepEqual(finishes, [true]);
+});
+
+test('throwing usage observers cannot break JSON or streamed response consumption', async () => {
+    const fail = () => { throw new Error('intentional observer test'); };
+    assert.deepEqual(await observeResponse(new Response('{"ok":true}'), fail, fail).json(), { ok: true });
+    const wire = 'data: {"ok":true}\n\ndata: [DONE]\n\n';
+    assert.equal(await observeResponse(streamResponse([wire]), fail, fail).text(), wire);
+});
+
 test('errored SSE streams finish unsuccessfully and preserve the read rejection', async () => {
     const failure = new Error('connection lost');
     const response = new Response(new ReadableStream({ start(controller) { controller.error(failure); } }),

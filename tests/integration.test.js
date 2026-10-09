@@ -25,10 +25,15 @@ async function harness(t) {
         'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'CHARACTER_MESSAGE_RENDERED', 'MESSAGE_UPDATED',
         'MESSAGE_DELETED', 'MORE_MESSAGES_LOADED', 'MESSAGE_SWIPE_DELETED'];
     const context = {
+        // Existing assistant targets model ST's established streaming target, not a
+        // normal nonstream fetch (whose new assistant is inserted after the request).
         chat: [{ is_user: true, mes: 'question' }, assistant()], chatId: 'chat-a', extensionSettings: {},
+        streamingProcessor: { messageId: 1 },
         eventTypes: Object.fromEntries(eventNames.map(name => [name, name])),
         eventSource: { on(name, callback) { const list = listeners.get(name) || []; list.push(callback); listeners.set(name, list); } },
         saveSettingsDebounced() {},
+        savedChats: [],
+        saveChat() { this.savedChats.push(structuredClone(this.chat)); return Promise.resolve(); },
     };
     const checkbox = { checked: false, addEventListener() {} };
     const document = {
@@ -90,7 +95,7 @@ test('nonstream request attaches normalized usage only on MESSAGE_RECEIVED and s
     assert.equal(h.context.chat[1].extra[KEY].requests.length, 1, 'a request attaches only once');
 });
 
-test('consuming SSE preserves original bytes then stores final usage on MESSAGE_RECEIVED', async t => {
+test('ST 1.19 streaming finalization preserves bytes and attaches after GENERATION_ENDED then MESSAGE_RECEIVED', async t => {
     const h = await harness(t);
     const wire = 'data: {"choices":[{"delta":{"content":"中文🙂"}}]}\r\n\r\n'
         + `data: ${JSON.stringify(usagePayload(80, 30, 9))}\r\n\r\ndata: [DONE]\r\n\r\n`;
@@ -103,7 +108,11 @@ test('consuming SSE preserves original bytes then stores final usage on MESSAGE_
     const response = await h.fetch({ stream: true });
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
     assert.equal(h.context.chat[1].extra, undefined);
+    // ST unlocks generation before its normal streaming MESSAGE_RECEIVED.
+    h.emit('GENERATION_ENDED');
+    assert.equal(h.context.chat[1].extra, undefined);
     h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    h.emit('CHARACTER_MESSAGE_RENDERED', 1, 'normal');
     const request = h.context.chat[1].extra[KEY].requests[0];
     assert.equal(request.complete, true);
     assert.equal(request.usage.inputTokens, 80);
@@ -174,7 +183,8 @@ test('continue appends separate requests and sums their token totals without rep
         h.responses.push(jsonResponse(payload));
         await (await h.fetch()).json();
     }
-    h.emit('MESSAGE_RECEIVED', 1, 'continue');
+    // ST's nonstream continue is finalized as appendFinal too.
+    h.emit('MESSAGE_RECEIVED', 1, 'appendFinal');
     const record = h.context.chat[1].extra[KEY];
     assert.equal(record.requests.length, 3);
     assert.equal(new Set(record.requests.map(request => request.id)).size, 3);
@@ -236,7 +246,7 @@ test('an in-flight response from a changed chat cannot attach to a later session
     assert.equal(h.context.chat[1].extra, undefined);
 });
 
-test('dry runs, ended sessions and user/system message targets do not receive records', async t => {
+test('dry runs and user/system message targets do not receive records; ended sessions collect no new requests', async t => {
     const h = await harness(t);
     h.emit('GENERATION_STARTED', 'normal', {}, true);
     await (await h.fetch()).json();
@@ -250,8 +260,9 @@ test('dry runs, ended sessions and user/system message targets do not receive re
     h.emit('MESSAGE_RECEIVED', 2, 'normal');
     assert.equal(h.context.chat[2].extra, undefined);
     h.emit('GENERATION_ENDED');
+    await (await h.fetch()).json();
     h.emit('MESSAGE_RECEIVED', 1, 'normal');
-    assert.equal(h.context.chat[1].extra, undefined);
+    assert.equal(h.context.chat[1].extra[KEY].requests.length, 1);
 });
 
 test('late stream usage updates an already attached message', async t => {
@@ -266,6 +277,79 @@ test('late stream usage updates an already attached message', async t => {
     assert.equal(record.requests[0].complete, true);
     assert.equal(record.requests[0].usage.inputTokens, 100);
     assert.deepEqual(h.context.chat[1].swipe_info[0].extra[KEY], record);
+});
+
+test('quiet overlap and actual request type cannot steal a visible generation', async t => {
+    const h = await harness(t);
+    h.emit('GENERATION_STARTED', 'normal');
+    await (await h.fetch({ type: 'normal' })).json();
+    h.emit('GENERATION_STARTED', 'quiet');
+    await (await h.fetch({ type: 'quiet' })).json();
+    h.emit('GENERATION_STARTED', 'impersonate');
+    await (await h.fetch({ type: 'impersonate' })).json();
+    h.emit('GENERATION_ENDED');
+    h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    assert.equal(h.context.chat[1].extra[KEY].requests.length, 1);
+});
+
+test('nonstream continuation appendFinal preserves earlier request and edited swipe metadata', async t => {
+    const h = await harness(t);
+    h.emit('GENERATION_STARTED', 'normal');
+    await (await h.fetch()).json();
+    h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    h.emit('GENERATION_STARTED', 'continue');
+    await (await h.fetch({ type: 'continue' })).json();
+    h.emit('MESSAGE_RECEIVED', 1, 'appendFinal');
+    assert.equal(h.context.chat[1].extra[KEY].requests.length, 2);
+    h.emit('MESSAGE_EDITED', 1);
+    assert.equal(h.context.chat[1].swipe_info[0].extra[KEY].edited, true);
+});
+
+test('normal request without established streaming target binds only the newly inserted message', async t => {
+    const h = await harness(t);
+    h.context.streamingProcessor = null;
+    h.context.chat = [{ is_user: true, mes: 'question' }];
+    h.emit('GENERATION_STARTED', 'normal');
+    await (await h.fetch({ type: 'normal' })).json();
+    h.context.chat.push(assistant());
+    h.emit('GENERATION_ENDED');
+    h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    assert.equal(h.context.chat[1].extra[KEY].requests.length, 1);
+});
+
+test('new swipe clears inherited live usage even if provider fails, preserving old candidate', async t => {
+    const h = await harness(t);
+    h.emit('GENERATION_STARTED', 'normal');
+    await (await h.fetch()).json();
+    h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    const old = structuredClone(h.context.chat[1].swipe_info[0].extra[KEY]);
+    h.context.chat[1].swipe_id = 1;
+    h.emit('GENERATION_STARTED', 'swipe');
+    h.responses.push(jsonResponse({}, 500));
+    await h.fetch({ type: 'swipe' });
+    assert.equal(h.context.chat[1].extra[KEY], undefined);
+    assert.deepEqual(h.context.chat[1].swipe_info[0].extra[KEY], old);
+});
+
+test('multiple pending generations targeting the same slot are left unknown rather than misattributed', async t => {
+    const h = await harness(t);
+    h.emit('GENERATION_STARTED', 'normal'); await (await h.fetch()).json();
+    h.emit('GENERATION_ENDED');
+    h.emit('GENERATION_STARTED', 'normal'); await (await h.fetch()).json();
+    h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    assert.equal(h.context.chat[1].extra?.[KEY], undefined);
+});
+
+test('canceled stream can preserve already observed partial usage with incomplete status', async t => {
+    const h = await harness(t);
+    const encoder = new TextEncoder();
+    h.responses.push(new Response(new ReadableStream({ start(c) { c.enqueue(encoder.encode(`data: ${JSON.stringify(usagePayload())}\n\n`)); } }), { headers: { 'content-type': 'text/event-stream' } }));
+    h.emit('GENERATION_STARTED', 'normal');
+    const reader = (await h.fetch({ stream: true })).body.getReader();
+    await reader.read(); await reader.cancel();
+    h.emit('GENERATION_ENDED'); h.emit('MESSAGE_RECEIVED', 1, 'normal');
+    assert.equal(h.context.chat[1].extra[KEY].requests[0].complete, false);
+    assert.equal(h.context.chat[1].extra[KEY].requests[0].usage.inputTokens, 100);
 });
 
 test('SSE provider errors are not attached to messages', async t => {
