@@ -1,0 +1,10 @@
+{
+  "display_name": "ST Cache Counter · 楼层 Token 统计",
+  "loading_order": 50,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "dthcle",
+  "version": "1.0.0"
+}
