@@ -4,7 +4,13 @@
 
 ## 安装
 
-在酒馆「扩展 → 安装扩展」中粘贴本仓库的 GitHub URL。安装后刷新页面。
+在酒馆「扩展 → 安装扩展」中粘贴：
+
+```text
+https://github.com/dthcle/ST-Cache-Counter
+```
+
+安装后刷新页面。也可以使用 Git 克隆到上述扩展目录，后续用 `git pull --ff-only` 更新。
 
 本地安装：将仓库整个目录复制到酒馆 `public/scripts/extensions/third-party/ST-Cache-Counter/`，刷新页面。在扩展设置中的「楼层 Token / 缓存统计」启用或停用。
 
